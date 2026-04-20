@@ -1,0 +1,55 @@
+#!/usr/bin/env -S python3 -u
+
+import argparse, socket, time, json, select, struct, sys, math
+from dnslib import DNSRecord, DNSHeader, RR, QTYPE, A
+
+class Server:
+    def __init__(self, root_ip, domain, port):
+        self.root_ip = root_ip
+        self.domain = domain
+
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(("0.0.0.0", port))
+        self.port = self.socket.getsockname()[1]
+
+        self.log("Bound to port %d" % self.port)
+
+    def log(self, message):
+        sys.stderr.write(message + "\n")
+        sys.stderr.flush()
+
+    def send(self, addr, message):
+        self.log("Sending message:\n%s" % message)
+        self.socket.sendto(message.pack(), addr)
+
+    def recv(self, socket):
+        data, addr = socket.recvfrom(65535)
+
+        # Unpack the DNS request
+        request = DNSRecord.parse(data)
+        self.log("Received message:\n%s" % request)
+
+        # YOU WILL NEED TO ACTUALLY DO SOMETHING SMART HERE
+        # WE ARE JUST REPLYING WITH A FIXED RESPONSE
+        response = request.reply()
+        response.add_answer(RR("abc.com", QTYPE.A, rdata=A("1.2.3.4"), ttl=60))       
+        
+        self.send(addr, response)
+
+    def run(self):
+        seq = 0
+        while True:
+            socks = select.select([self.socket], [], [], 0.1)[0]
+            for conn in socks:
+                self.recv(conn)
+
+        return
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='send data')
+    parser.add_argument('root_ip', type=str, help="The IP address of the root server")
+    parser.add_argument('zone', type=str, help="The zone file for this server")
+    parser.add_argument('--port', type=int, help="The port this server should bind to", default=0)
+    args = parser.parse_args()
+    sender = Server(args.root_ip, args.zone, args.port)
+    sender.run()
