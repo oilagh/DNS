@@ -1,55 +1,216 @@
-#!/usr/bin/env -S python3 -u
+import sys
+import socket
+import time
+from dnslib import *
 
-import argparse, socket, time, json, select, struct, sys, math
-from dnslib import DNSRecord, DNSHeader, RR, QTYPE, A
+CACHE = {}
 
-class Server:
-    def __init__(self, root_ip, domain, port):
-        self.root_ip = root_ip
-        self.domain = domain
+# Cache Helpers
+def cache_get(key):
+    if key in CACHE:
+        entry = CACHE[key]
+        if time.time() < entry["expires"]:
+            return entry["response"]
+        else:
+            del CACHE[key]
+    return None
 
-        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.socket.bind(("0.0.0.0", port))
-        self.port = self.socket.getsockname()[1]
+def cache_set(key, response):
+    ttl = min([rr.ttl for rr in response.rr]) if response.rr else 0
+    if ttl > 0:
+        CACHE[key] = {
+            "response": response,
+            "expires": time.time() + ttl
+        }
 
-        self.log("Bound to port %d" % self.port)
+# Zone Parsing
+def load_zone(zone_file):
+    zone = {}
+    origin = None
 
-    def log(self, message):
-        sys.stderr.write(message + "\n")
-        sys.stderr.flush()
+    with open(zone_file) as f:
+        lines = f.readlines()
 
-    def send(self, addr, message):
-        self.log("Sending message:\n%s" % message)
-        self.socket.sendto(message.pack(), addr)
+    current_name = None
 
-    def recv(self, socket):
-        data, addr = socket.recvfrom(65535)
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith(";"):
+            continue
 
-        # Unpack the DNS request
+        if line.startswith("$ORIGIN"):
+            origin = line.split()[1]
+            continue
+
+        rr = RR.fromZone(line)
+        for record in rr:
+            name = str(record.rname)
+            zone.setdefault(name, []).append(record)
+
+    return zone, origin
+
+
+# Authoritative Answer
+def handle_authoritative(request, zone, origin):
+    qname = str(request.q.qname)
+    qtype = QTYPE[request.q.qtype]
+
+    reply = request.reply()
+    reply.header.aa = 1
+
+    if qname not in zone:
+        reply.header.rcode = RCODE.NXDOMAIN
+        return reply
+
+    records = zone[qname]
+
+    for r in records:
+        if QTYPE[r.rtype] == qtype or qtype == "ANY":
+            reply.add_answer(r)
+
+        # Handle CNAME chaining
+        if QTYPE[r.rtype] == "CNAME":
+            reply.add_answer(r)
+            cname_target = str(r.rdata.label)
+            if cname_target in zone:
+                for extra in zone[cname_target]:
+                    if QTYPE[extra.rtype] == "A":
+                        reply.add_answer(extra)
+
+    return reply
+
+
+# Send DNS Query
+def send_query(qname, qtype, server_ip):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(2)
+
+    q = DNSRecord.question(qname, qtype)
+    sock.sendto(q.pack(), (server_ip, 60053))
+
+    try:
+        data, _ = sock.recvfrom(4096)
+        return DNSRecord.parse(data)
+    except:
+        return None
+
+
+# Bailiwick Check
+def in_bailiwick(name, domain):
+    return name.endswith(domain)
+
+
+# Recursive Resolver
+def resolve(qname, qtype, root_ip):
+    cache_key = (qname, qtype)
+    cached = cache_get(cache_key)
+    if cached:
+        return cached
+
+    server_ip = root_ip
+
+    while True:
+        response = send_query(qname, qtype, server_ip)
+        if response is None:
+            return None
+
+        # If answer found
+        if response.rr:
+            cache_set(cache_key, response)
+            return response
+
+        # Follow NS referrals
+        ns_records = [rr for rr in response.auth if QTYPE[rr.rtype] == "NS"]
+
+        if not ns_records:
+            return response
+
+        # Try glue records first
+        for add in response.ar:
+            if QTYPE[add.rtype] == "A":
+                server_ip = str(add.rdata)
+                break
+        else:
+            # Resolve NS manually
+            ns_name = str(ns_records[0].rdata.label)
+            ns_resp = resolve(ns_name, "A", root_ip)
+            if ns_resp and ns_resp.rr:
+                server_ip = str(ns_resp.rr[0].rdata)
+            else:
+                return None
+
+
+# Handle Request
+def handle_request(data, addr, sock, zone, origin, root_ip):
+    try:
         request = DNSRecord.parse(data)
-        self.log("Received message:\n%s" % request)
-
-        # YOU WILL NEED TO ACTUALLY DO SOMETHING SMART HERE
-        # WE ARE JUST REPLYING WITH A FIXED RESPONSE
-        response = request.reply()
-        response.add_answer(RR("abc.com", QTYPE.A, rdata=A("1.2.3.4"), ttl=60))       
-        
-        self.send(addr, response)
-
-    def run(self):
-        seq = 0
-        while True:
-            socks = select.select([self.socket], [], [], 0.1)[0]
-            for conn in socks:
-                self.recv(conn)
-
+    except:
         return
 
+    # Reject multiple questions
+    if len(request.questions) != 1:
+        reply = request.reply()
+        reply.header.rcode = RCODE.SERVFAIL
+        sock.sendto(reply.pack(), addr)
+        return
+
+    qname = str(request.q.qname)
+    qtype = QTYPE[request.q.qtype]
+
+    # Authoritative
+    if qname.endswith(origin):
+        reply = handle_authoritative(request, zone, origin)
+        sock.sendto(reply.pack(), addr)
+        return
+
+    # Recursive required but RD not set
+    if not request.header.rd:
+        reply = request.reply()
+        reply.header.rcode = RCODE.SERVFAIL
+        sock.sendto(reply.pack(), addr)
+        return
+
+    # Recursive resolve
+    response = resolve(qname, qtype, root_ip)
+
+    if response is None:
+        reply = request.reply()
+        reply.header.rcode = RCODE.SERVFAIL
+        sock.sendto(reply.pack(), addr)
+        return
+
+    reply = request.reply()
+    reply.rr = response.rr
+    reply.auth = response.auth
+    reply.ar = response.ar
+
+    sock.sendto(reply.pack(), addr)
+
+
+# Main Server Loop
+def main():
+    port = 0
+    args = sys.argv[1:]
+
+    if args[0] == "--port":
+        port = int(args[1])
+        args = args[2:]
+
+    root_ip = args[0]
+    zone_file = args[1]
+
+    zone, origin = load_zone(zone_file)
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("127.0.0.1", port))
+
+    actual_port = sock.getsockname()[1]
+    print(f"Bound to port {actual_port}", flush=True)
+
+    while True:
+        data, addr = sock.recvfrom(4096)
+        handle_request(data, addr, sock, zone, origin, root_ip)
+
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='send data')
-    parser.add_argument('root_ip', type=str, help="The IP address of the root server")
-    parser.add_argument('zone', type=str, help="The zone file for this server")
-    parser.add_argument('--port', type=int, help="The port this server should bind to", default=0)
-    args = parser.parse_args()
-    sender = Server(args.root_ip, args.zone, args.port)
-    sender.run()
+    main()
