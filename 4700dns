@@ -2,217 +2,369 @@
 import sys
 import socket
 import time
+import threading
 from dnslib import *
 
-CACHE = {}
+_cache = {}
+_cache_lock = threading.Lock()
 
-# Cache Helpers
-def cache_get(key):
-    if key in CACHE:
-        entry = CACHE[key]
-        if time.time() < entry["expires"]:
-            return entry["response"]
-        else:
-            del CACHE[key]
-    return None
+def _norm(name):
+    s = str(name).lower()
+    return s if s.endswith('.') else s + '.'
 
-def cache_set(key, response):
-    ttl = min([rr.ttl for rr in response.rr]) if response.rr else 0
-    if ttl > 0:
-        CACHE[key] = {
-            "response": response,
-            "expires": time.time() + ttl
-        }
+def cache_put(rr):
+    if rr.ttl <= 0:
+        return
+    key = (_norm(rr.rname), rr.rtype)
+    exp = time.time() + rr.ttl
+    with _cache_lock:
+        now = time.time()
+        bucket = [e for e in _cache.get(key, []) if e[1] > now]
+        rdstr = str(rr.rdata)
+        if not any(str(e[0].rdata) == rdstr for e in bucket):
+            bucket.append((rr, exp))
+        _cache[key] = bucket
 
-# Zone Parsing (FIXED)
+def cache_get(qname, qtype):
+    key = (_norm(qname), qtype)
+    now = time.time()
+    with _cache_lock:
+        bucket = [e for e in _cache.get(key, []) if e[1] > now]
+        if not bucket:
+            _cache.pop(key, None)
+            return None
+        _cache[key] = bucket
+        return [RR(r.rname, r.rtype, r.rclass, max(1, int(exp - now)), r.rdata)
+                for r, exp in bucket]
+    
 def load_zone(zone_file):
+    with open(zone_file) as f:
+        text = f.read()
     zone = {}
     origin = None
-
-    with open(zone_file) as f:
-        zone_text = f.read()
-
-    records = RR.fromZone(zone_text)
-
-    for record in records:
-        name = str(record.rname)
-        zone.setdefault(name, []).append(record)
-
-        if record.rtype == QTYPE.SOA:
+    for rr in RR.fromZone(text):
+        name = _norm(rr.rname)
+        zone.setdefault(name, []).append(rr)
+        if rr.rtype == QTYPE.SOA:
             origin = name
-
-    if origin and not origin.endswith('.'):
-        origin += '.'
-
     return zone, origin
 
+def handle_authoritative(req, zone, origin):
+    qname = _norm(req.q.qname)
+    qtype = req.q.qtype
 
-# Authoritative Answer
-def handle_authoritative(request, zone, origin):
-    qname = str(request.q.qname)
-    qtype = QTYPE[request.q.qtype]
-
-    reply = request.reply()
+    reply = req.reply()
     reply.header.aa = 1
+    reply.header.ra = 1
 
-    if qname not in zone:
+    soa_rr = next((r for r in zone.get(origin, []) if r.rtype == QTYPE.SOA), None)
+
+    parts = qname.rstrip('.').split('.')
+    for i in range(1, len(parts)):
+        zone_check = '.'.join(parts[i:]) + '.'
+        if zone_check == origin:
+            break
+        if zone_check in zone:
+            ns_rrs = [r for r in zone[zone_check] if r.rtype == QTYPE.NS]
+            if ns_rrs:
+                reply.header.aa = 0
+                for ns in ns_rrs:
+                    reply.add_auth(ns)
+                    ns_host = _norm(ns.rdata.label)
+                    for ar in zone.get(ns_host, []):
+                        if ar.rtype == QTYPE.A:
+                            reply.add_ar(ar)
+                return reply
+
+    records = zone.get(qname)
+
+    if records is None:
         reply.header.rcode = RCODE.NXDOMAIN
+        if soa_rr:
+            reply.add_auth(soa_rr)
         return reply
 
-    records = zone[qname]
+    if qtype == QTYPE.NS:
+        ns_rrs = [r for r in records if r.rtype == QTYPE.NS]
+        if ns_rrs:
+            for r in ns_rrs:
+                reply.add_answer(r)
+            for r in ns_rrs:
+                ns_host = _norm(r.rdata.label)
+                for ar in zone.get(ns_host, []):
+                    if ar.rtype == QTYPE.A:
+                        reply.add_ar(ar)
+            return reply
 
-    found = False
-
-    for r in records:
-        if QTYPE[r.rtype] == qtype or qtype == "ANY":
+    cname_rrs = [r for r in records if r.rtype == QTYPE.CNAME]
+    if qtype != QTYPE.CNAME and cname_rrs:
+        for r in cname_rrs:
             reply.add_answer(r)
-            found = True
+        target = _norm(cname_rrs[0].rdata.label)
+        visited = {qname}
+        while target not in visited:
+            visited.add(target)
+            if not (target == origin or target.endswith('.' + origin)):
+                break
+            t_records = zone.get(target, [])
+            if not t_records:
+                break
+            t_cnames = [r for r in t_records if r.rtype == QTYPE.CNAME]
+            if t_cnames:
+                for r in t_cnames:
+                    reply.add_answer(r)
+                target = _norm(t_cnames[0].rdata.label)
+            else:
+                for r in t_records:
+                    if r.rtype == qtype:
+                        reply.add_answer(r)
+                break
+        return reply
 
-        # CNAME handling
-        if QTYPE[r.rtype] == "CNAME":
+    matched = [r for r in records if r.rtype == qtype or qtype == QTYPE.ANY]
+    if matched:
+        for r in matched:
             reply.add_answer(r)
-            cname_target = str(r.rdata.label)
+        if qtype == QTYPE.MX:
+            for r in matched:
+                mx_host = _norm(r.rdata.label)
+                for ar in zone.get(mx_host, []):
+                    if ar.rtype == QTYPE.A:
+                        reply.add_ar(ar)
+        return reply
 
-            if cname_target in zone:
-                for extra in zone[cname_target]:
-                    if QTYPE[extra.rtype] == "A":
-                        reply.add_answer(extra)
-
-    if not found and not reply.rr:
-        reply.header.rcode = RCODE.NXDOMAIN
-
+    if soa_rr:
+        reply.add_auth(soa_rr)
     return reply
 
 
-# Send DNS Query
-def send_query(qname, qtype, server_ip):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.settimeout(2)
+DNS_PORT = 60053
 
-    q = DNSRecord.question(qname, qtype)
-    sock.sendto(q.pack(), (server_ip, 60053))
+def send_query(qname, qtype, server_ip, timeout=2.0, retries=2):
+    qt = qtype if isinstance(qtype, int) else getattr(QTYPE, qtype)
+    for _ in range(retries):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(timeout)
+        try:
+            q = DNSRecord.question(qname, QTYPE[qt] if isinstance(qt, int) else qt)
+            q.header.rd = 0
+            sock.sendto(q.pack(), (server_ip, DNS_PORT))
+            data, _ = sock.recvfrom(65535)
+            return DNSRecord.parse(data)
+        except socket.timeout:
+            pass
+        except Exception:
+            return None
+        finally:
+            sock.close()
+    return None
 
-    try:
-        data, _ = sock.recvfrom(4096)
-        return DNSRecord.parse(data)
-    except:
+def in_bailiwick(rr_name, bailiwick):
+    n = _norm(rr_name)
+    b = _norm(bailiwick)
+    if b == '.':
+        return True
+    return n == b or n.endswith('.' + b)
+
+def apply_bailiwick(response, bailiwick):
+    response.rr   = [r for r in response.rr   if in_bailiwick(r.rname, bailiwick)]
+    response.auth = [r for r in response.auth  if in_bailiwick(r.rname, bailiwick)]
+    response.ar   = [r for r in response.ar    if in_bailiwick(r.rname, bailiwick)]
+    return response
+
+def get_ns_ips(candidate_ns, additional, root_ip, depth):
+    """Return list of IPs for the given NS records: glue > cache > resolve."""
+    ips = []
+    seen = set()
+
+    for ns_rr in candidate_ns:
+        ns_host = _norm(ns_rr.rdata.label)
+        for ar in additional:
+            if ar.rtype == QTYPE.A and _norm(ar.rname) == ns_host:
+                ip = str(ar.rdata)
+                if ip not in seen:
+                    ips.append(ip)
+                    seen.add(ip)
+
+    if not ips:
+        for ns_rr in candidate_ns:
+            ns_host = _norm(ns_rr.rdata.label)
+            c = cache_get(ns_host, QTYPE.A)
+            if c:
+                for r in c:
+                    ip = str(r.rdata)
+                    if ip not in seen:
+                        ips.append(ip)
+                        seen.add(ip)
+
+    if not ips:
+        for ns_rr in candidate_ns:
+            ns_host = _norm(ns_rr.rdata.label)
+            sub = resolve(ns_host, QTYPE.A, root_ip, depth + 1)
+            if sub and sub.rr:
+                for r in sub.rr:
+                    if r.rtype == QTYPE.A:
+                        ip = str(r.rdata)
+                        if ip not in seen:
+                            ips.append(ip)
+                            seen.add(ip)
+
+    return ips
+
+def resolve(qname, qtype, root_ip, depth=0):
+    if depth > 20:
         return None
 
+    qname = _norm(qname)
+    qt = qtype if isinstance(qtype, int) else getattr(QTYPE, qtype)
 
-# Recursive Resolver
-def resolve(qname, qtype, root_ip):
-    cache_key = (qname, qtype)
-    cached = cache_get(cache_key)
+    cached = cache_get(qname, qt)
     if cached:
-        return cached
+        resp = DNSRecord()
+        resp.header.qr = 1
+        resp.header.ra = 1
+        for rr in cached:
+            resp.add_answer(rr)
+        return resp
 
-    server_ip = root_ip
+    current_servers = [root_ip]
+    bailiwick = '.'
 
-    while True:
-        response = send_query(qname, qtype, server_ip)
+    for _ in range(30):
+        response = None
+        for srv in current_servers:
+            response = send_query(qname, qt, srv)
+            if response is not None:
+                break
+
         if response is None:
             return None
 
-        # If answer found
+        if response.header.rcode not in (RCODE.NOERROR, RCODE.NXDOMAIN):
+            return response
+
+        apply_bailiwick(response, bailiwick)
+
+        for rr in response.rr + response.auth + response.ar:
+            if rr.ttl > 0:
+                cache_put(rr)
+
+        if response.header.rcode == RCODE.NXDOMAIN:
+            return response
+
         if response.rr:
-            cache_set(cache_key, response)
+            if qt not in (QTYPE.CNAME, QTYPE.ANY):
+                cnames = [r for r in response.rr if r.rtype == QTYPE.CNAME]
+                non_cnames = [r for r in response.rr if r.rtype != QTYPE.CNAME]
+                if cnames and not non_cnames:
+                    target = _norm(cnames[-1].rdata.label)
+                    sub = resolve(target, qt, root_ip, depth + 1)
+                    if sub and sub.rr:
+                        for r in sub.rr:
+                            response.add_answer(r)
             return response
 
-        # Follow NS referrals
-        ns_records = [rr for rr in response.auth if QTYPE[rr.rtype] == "NS"]
-
-        if not ns_records:
+        ns_rrs = [r for r in response.auth if r.rtype == QTYPE.NS]
+        if not ns_rrs:
+            ns_rrs = [r for r in response.rr if r.rtype == QTYPE.NS]
+        if not ns_rrs:
             return response
 
-        # Try glue A records
-        glue_found = False
-        for add in response.ar:
-            if QTYPE[add.rtype] == "A":
-                server_ip = str(add.rdata)
-                glue_found = True
-                break
+        best_zone = None
+        for ns_rr in ns_rrs:
+            z = _norm(ns_rr.rname)
+            if (qname == z or qname.endswith('.' + z)):
+                if best_zone is None or len(z) > len(best_zone):
+                    best_zone = z
+        if best_zone is None:
+            best_zone = _norm(ns_rrs[0].rname)
 
-        if not glue_found:
-            # Resolve NS manually
-            ns_name = str(ns_records[0].rdata.label)
-            ns_resp = resolve(ns_name, "A", root_ip)
+        candidate_ns = [r for r in ns_rrs if _norm(r.rname) == best_zone]
 
-            if ns_resp and ns_resp.rr:
-                server_ip = str(ns_resp.rr[0].rdata)
-            else:
-                return None
+        next_servers = get_ns_ips(candidate_ns, response.ar, root_ip, depth)
+        if not next_servers:
+            return None
 
+        current_servers = next_servers
+        bailiwick = best_zone
 
-# Handle Request
+    return None
+
 def handle_request(data, addr, sock, zone, origin, root_ip):
     try:
         request = DNSRecord.parse(data)
-    except:
-        return
-
-    if len(request.questions) != 1:
-        reply = request.reply()
-        reply.header.rcode = RCODE.SERVFAIL
-        sock.sendto(reply.pack(), addr)
-        return
-
-    qname = str(request.q.qname)
-    qtype = QTYPE[request.q.qtype]
-
-    # Authoritative
-    if origin and qname.endswith(origin):
-        reply = handle_authoritative(request, zone, origin)
-        sock.sendto(reply.pack(), addr)
-        return
-
-    # No recursion allowed
-    if not request.header.rd:
-        reply = request.reply()
-        reply.header.rcode = RCODE.SERVFAIL
-        sock.sendto(reply.pack(), addr)
-        return
-
-    # Recursive
-    response = resolve(qname, qtype, root_ip)
-
-    if response is None:
-        reply = request.reply()
-        reply.header.rcode = RCODE.SERVFAIL
-        sock.sendto(reply.pack(), addr)
+    except Exception:
         return
 
     reply = request.reply()
-    reply.rr = response.rr
-    reply.auth = response.auth
-    reply.ar = response.ar
+
+    try:
+        if len(request.questions) != 1:
+            reply.header.rcode = RCODE.SERVFAIL
+            sock.sendto(reply.pack(), addr)
+            return
+
+        qname = _norm(request.q.qname)
+        qtype = request.q.qtype
+
+        if origin and (qname == origin or qname.endswith('.' + origin)):
+            result = handle_authoritative(request, zone, origin)
+            sock.sendto(result.pack(), addr)
+            return
+
+        reply.header.aa = 0
+
+        if not request.header.rd:
+            reply.header.rcode = RCODE.SERVFAIL
+            sock.sendto(reply.pack(), addr)
+            return
+
+        reply.header.ra = 1
+
+        response = resolve(qname, qtype, root_ip)
+
+        if response is None:
+            reply.header.rcode = RCODE.SERVFAIL
+            sock.sendto(reply.pack(), addr)
+            return
+
+        reply.header.rcode = response.header.rcode
+        reply.rr   = response.rr
+        reply.auth = response.auth
+        reply.ar   = response.ar
+
+    except Exception as e:
+        print(f"Error handling request: {e}", file=sys.stderr, flush=True)
+        reply.header.rcode = RCODE.SERVFAIL
 
     sock.sendto(reply.pack(), addr)
 
-
-# Main Server Loop
 def main():
-    port = 0
     args = sys.argv[1:]
+    port = 0
 
-    if args[0] == "--port":
+    if args[0] == '--port':
         port = int(args[1])
         args = args[2:]
 
-    root_ip = args[0]
-    zone_file = args[1]
-
+    root_ip, zone_file = args[0], args[1]
     zone, origin = load_zone(zone_file)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind(("127.0.0.1", port))
-
+    sock.bind(('127.0.0.1', port))
     actual_port = sock.getsockname()[1]
-    print(f"Bound to port {actual_port}", flush=True)
+    print(f'Bound to port {actual_port}', flush=True)
 
     while True:
-        data, addr = sock.recvfrom(4096)
-        handle_request(data, addr, sock, zone, origin, root_ip)
+        try:
+            data, addr = sock.recvfrom(65535)
+            threading.Thread(
+                target=handle_request,
+                args=(data, addr, sock, zone, origin, root_ip),
+                daemon=True
+            ).start()
+        except Exception as e:
+            print(f'Main loop error: {e}', file=sys.stderr, flush=True)
 
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
