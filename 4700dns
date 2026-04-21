@@ -24,29 +24,25 @@ def cache_set(key, response):
             "expires": time.time() + ttl
         }
 
-# Zone Parsing
+# Zone Parsing (FIXED)
 def load_zone(zone_file):
     zone = {}
     origin = None
 
     with open(zone_file) as f:
-        lines = f.readlines()
+        zone_text = f.read()
 
-    current_name = None
+    records = RR.fromZone(zone_text)
 
-    for line in lines:
-        line = line.strip()
-        if not line or line.startswith(";"):
-            continue
+    for record in records:
+        name = str(record.rname)
+        zone.setdefault(name, []).append(record)
 
-        if line.startswith("$ORIGIN"):
-            origin = line.split()[1]
-            continue
+        if record.rtype == QTYPE.SOA:
+            origin = name
 
-        rr = RR.fromZone(line)
-        for record in rr:
-            name = str(record.rname)
-            zone.setdefault(name, []).append(record)
+    if origin and not origin.endswith('.'):
+        origin += '.'
 
     return zone, origin
 
@@ -65,18 +61,25 @@ def handle_authoritative(request, zone, origin):
 
     records = zone[qname]
 
+    found = False
+
     for r in records:
         if QTYPE[r.rtype] == qtype or qtype == "ANY":
             reply.add_answer(r)
+            found = True
 
-        # Handle CNAME chaining
+        # CNAME handling
         if QTYPE[r.rtype] == "CNAME":
             reply.add_answer(r)
             cname_target = str(r.rdata.label)
+
             if cname_target in zone:
                 for extra in zone[cname_target]:
                     if QTYPE[extra.rtype] == "A":
                         reply.add_answer(extra)
+
+    if not found and not reply.rr:
+        reply.header.rcode = RCODE.NXDOMAIN
 
     return reply
 
@@ -94,11 +97,6 @@ def send_query(qname, qtype, server_ip):
         return DNSRecord.parse(data)
     except:
         return None
-
-
-# Bailiwick Check
-def in_bailiwick(name, domain):
-    return name.endswith(domain)
 
 
 # Recursive Resolver
@@ -126,15 +124,19 @@ def resolve(qname, qtype, root_ip):
         if not ns_records:
             return response
 
-        # Try glue records first
+        # Try glue A records
+        glue_found = False
         for add in response.ar:
             if QTYPE[add.rtype] == "A":
                 server_ip = str(add.rdata)
+                glue_found = True
                 break
-        else:
+
+        if not glue_found:
             # Resolve NS manually
             ns_name = str(ns_records[0].rdata.label)
             ns_resp = resolve(ns_name, "A", root_ip)
+
             if ns_resp and ns_resp.rr:
                 server_ip = str(ns_resp.rr[0].rdata)
             else:
@@ -148,7 +150,6 @@ def handle_request(data, addr, sock, zone, origin, root_ip):
     except:
         return
 
-    # Reject multiple questions
     if len(request.questions) != 1:
         reply = request.reply()
         reply.header.rcode = RCODE.SERVFAIL
@@ -159,19 +160,19 @@ def handle_request(data, addr, sock, zone, origin, root_ip):
     qtype = QTYPE[request.q.qtype]
 
     # Authoritative
-    if qname.endswith(origin):
+    if origin and qname.endswith(origin):
         reply = handle_authoritative(request, zone, origin)
         sock.sendto(reply.pack(), addr)
         return
 
-    # Recursive required but RD not set
+    # No recursion allowed
     if not request.header.rd:
         reply = request.reply()
         reply.header.rcode = RCODE.SERVFAIL
         sock.sendto(reply.pack(), addr)
         return
 
-    # Recursive resolve
+    # Recursive
     response = resolve(qname, qtype, root_ip)
 
     if response is None:
