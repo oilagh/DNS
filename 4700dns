@@ -140,7 +140,7 @@ def handle_authoritative(req, zone, origin):
 
 DNS_PORT = 60053
 
-def send_query(qname, qtype, server_ip, timeout=2.0, retries=2):
+def send_query(qname, qtype, server_ip, timeout=2.0, retries=3):
     qt = qtype if isinstance(qtype, int) else getattr(QTYPE, qtype)
     for _ in range(retries):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -150,14 +150,30 @@ def send_query(qname, qtype, server_ip, timeout=2.0, retries=2):
             q.header.rd = 0
             sock.sendto(q.pack(), (server_ip, DNS_PORT))
             data, _ = sock.recvfrom(65535)
-            return DNSRecord.parse(data)
+            resp = DNSRecord.parse(data)
+            if not resp.header.tc:
+                return resp
+            # TC=1 means truncated — retry
         except socket.timeout:
             pass
         except Exception:
-            return None
+            pass  # parse error or send error — retry
         finally:
             sock.close()
     return None
+
+def _add_ns_glue(resp, ns_rrs):
+    """Add cached A records for NS servers to resp's additional section."""
+    existing = {_norm(ar.rname) for ar in resp.ar}
+    for rr in ns_rrs:
+        if rr.rtype == QTYPE.NS:
+            ns_host = _norm(rr.rdata.label)
+            if ns_host not in existing:
+                glue = cache_get(ns_host, QTYPE.A)
+                if glue:
+                    for ar in glue:
+                        resp.add_ar(ar)
+                    existing.add(ns_host)
 
 def in_bailiwick(rr_name, bailiwick):
     n = _norm(rr_name)
@@ -225,6 +241,7 @@ def resolve(qname, qtype, root_ip, depth=0):
         resp.header.ra = 1
         for rr in cached:
             resp.add_answer(rr)
+        _add_ns_glue(resp, resp.rr)
         return resp
 
     current_servers = [root_ip]
@@ -262,6 +279,7 @@ def resolve(qname, qtype, root_ip, depth=0):
                     if sub and sub.rr:
                         for r in sub.rr:
                             response.add_answer(r)
+            _add_ns_glue(response, response.rr)
             return response
 
         ns_rrs = [r for r in response.auth if r.rtype == QTYPE.NS]
@@ -269,6 +287,16 @@ def resolve(qname, qtype, root_ip, depth=0):
             ns_rrs = [r for r in response.rr if r.rtype == QTYPE.NS]
         if not ns_rrs:
             return response
+
+        # For NS queries, if the auth section contains NS records for exactly
+        # the domain we're asking about, that IS the answer — no need to follow
+        if qt == QTYPE.NS:
+            direct = [r for r in ns_rrs if _norm(r.rname) == qname]
+            if direct:
+                for r in direct:
+                    response.add_answer(r)
+                _add_ns_glue(response, direct)
+                return response
 
         best_zone = None
         for ns_rr in ns_rrs:
